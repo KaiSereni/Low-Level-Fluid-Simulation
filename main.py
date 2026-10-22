@@ -6,12 +6,15 @@ import random
 
 ti.init(arch=ti.metal)
 
-TiVectorList = ti.types.ndarray(dtype=ti.f16, ndim=2) # each particle has a position vector
-TiParticleStateMatrix = ti.types.ndarray(dtype=ti.f16, ndim=3) # each particle has a list containing a position vector and a velocity vector
+TiParticleStateMatrix = ti.types.ndarray(dtype=ti.f32, ndim=3) # each particle has a list containing a position vector and a velocity vector
 
-TiPixelArray = ti.types.ndarray(dtype=ti.f16, ndim=3) # each x, y has a vec3
-
-DT = np.float16(0.5)
+DT = np.float32(0.03)
+G = np.float32(400.0)
+PART_INFLUENCE_RANGE = np.float32(50.0)
+PART_FORCE = np.float32(1.0)
+BOUNCE_DAMP = np.float32(0.95)
+FRICTION = np.float32(0.95)
+BROWNIAN_MOTION = np.float32(0.2)
  
 @dataclass
 class Particle:
@@ -22,58 +25,75 @@ class Particle:
         self.p = p
         self.v = v
 
+@ti.func
+def distance_to_force(d: ti.f16) -> ti.f16:
+    o = 0.0
+    d = ti.abs(d)
+    if d < PART_INFLUENCE_RANGE:
+        o = (-4 * pow(d - PART_INFLUENCE_RANGE, 3))/pow(PART_INFLUENCE_RANGE, 3) * PART_INFLUENCE_RANGE
+    return o * PART_FORCE * DT
+
 @ti.kernel
-def increment_fluid(particle_states: TiParticleStateMatrix, sceneWidth: ti.i16, sceneHeight: ti.i16):
-    for i in range(particle_states.shape[0]):
-        # particle index, p/v, x/y
-        particle_states[i, 0, 0] = particle_states[i, 0, 0] + ti.float16(particle_states[i, 1, 0] * DT)
-        particle_states[i, 0, 1] = particle_states[i, 0, 1] + ti.float16(particle_states[i, 1, 1] * DT)
+def increment_fluid(particle_states: TiParticleStateMatrix, sceneWidth: ti.i32, sceneHeight: ti.i32):
+    num_parts = particle_states.shape[0]
+    for i in range(num_parts):
+        for other_particle_index in range(num_parts):
+            if other_particle_index != i:
+                relative_pos = tm.vec2(
+                    particle_states[i, 0, 0] - particle_states[other_particle_index, 0, 0],
+                    particle_states[i, 0, 1] - particle_states[other_particle_index, 0, 1]
+                )
+                r = relative_pos.norm()
+                force = distance_to_force(r)
+                particle_states[i, 1, 0] += relative_pos[0] * force
+                particle_states[i, 1, 1] += relative_pos[1] * force
+
+        particle_states[i, 0, 0] = particle_states[i, 0, 0] + ti.float32(particle_states[i, 1, 0] * DT)
+        particle_states[i, 0, 1] = particle_states[i, 0, 1] + ti.float32(particle_states[i, 1, 1] * DT)
+        
+        particle_states[i, 1, 1] -= ti.float32(G * DT)
+
+        # brownian boop
+        particle_states[i, 1, 0] += ti.randn(dt=ti.float32) * BROWNIAN_MOTION
+        particle_states[i, 1, 1] += ti.randn(dt=ti.float32) * BROWNIAN_MOTION
 
         if (particle_states[i, 0, 0] < 0):
             particle_states[i, 0, 0] = 0
-            particle_states[i, 1, 0] = ti.abs(particle_states[i, 1, 0])
-            particle_states[i, 1, 1] *= ti.float16(0.98)
+            particle_states[i, 1, 0] = ti.abs(particle_states[i, 1, 0]) * BOUNCE_DAMP
+            particle_states[i, 1, 1] *= ti.float32(FRICTION)
 
         elif (particle_states[i, 0, 0] > sceneWidth):
             particle_states[i, 0, 0] = sceneWidth
-            particle_states[i, 1, 0] = -ti.abs(particle_states[i, 1, 0])
-            particle_states[i, 1, 1] *= ti.float16(0.98)
+            particle_states[i, 1, 0] = -ti.abs(particle_states[i, 1, 0]) * BOUNCE_DAMP
+            particle_states[i, 1, 1] *= ti.float32(FRICTION)
 
         if (particle_states[i, 0, 1] < 0):
             particle_states[i, 0, 1] = 0
-            particle_states[i, 1, 1] = ti.abs(particle_states[i, 1, 1])
-            particle_states[i, 1, 0] *= ti.float16(0.98)
+            particle_states[i, 1, 1] = ti.abs(particle_states[i, 1, 1]) * BOUNCE_DAMP
+            particle_states[i, 1, 0] *= ti.float32(FRICTION)
 
         elif (particle_states[i, 0, 1] > sceneHeight):
             particle_states[i, 0, 1] = sceneHeight
-            particle_states[i, 1, 1] = -ti.abs(particle_states[i, 1, 1])
-            particle_states[i, 1, 0] *= ti.float16(0.98)
-        
-        particle_states[i, 1, 1] -= ti.float16(5.0 * DT)
-
-@ti.func
-def comparePixels(target: TiPixelArray, x: ti.i16, y: ti.i16, value: ti.types.vector(3, ti.f16)) -> bool: #type: ignore
-    o = True
-    for i in range(target.shape[2]):
-        if not target[x, y, i] == value[i]:
-            o = False
-            break
-    return o
-
-@ti.func
-def assignPixel(target: TiPixelArray, x: ti.i16, y: ti.i16, value: ti.types.vector(3, ti.f16)): #type: ignore
-    for i in range(target.shape[2]):
-        target[x, y, i] = value[i]
+            particle_states[i, 1, 1] = -ti.abs(particle_states[i, 1, 1]) * BOUNCE_DAMP
+            particle_states[i, 1, 0] *= ti.float32(FRICTION)
 
 @ti.kernel
-def draw_ui(pixels: TiPixelArray, particle_positions: TiVectorList, part_color: ti.types.vector(3, ti.f16), part_rad: ti.i16): #type: ignore
-    screen_shape = pixels.shape
-    for x in range(screen_shape[0]-1):
-        for y in range(screen_shape[1]-1):
-            if not comparePixels(pixels, x, y, part_color):
-                for part_index in range(particle_positions.shape[0]):
-                    if ti.pow(particle_positions[part_index, 0] - x, 2) + ti.pow(particle_positions[part_index, 1] - y, 2) < ti.pow(part_rad, 2):
-                        assignPixel(pixels, x, y, part_color)
+def draw_ui(pixels: ti.template(), particle_positions: TiParticleStateMatrix, part_color: ti.types.vector(3, ti.f32), part_rad: ti.i32): #type: ignore
+    screen_x, screen_y = pixels.shape[:2]
+    num_parts = particle_positions.shape[0]
+    for part_index in range(num_parts):
+        particle_x = ti.cast(particle_positions[part_index, 0, 0], ti.i32)
+        particle_y = ti.cast(particle_positions[part_index, 0, 1], ti.i32)
+        for i in range(-part_rad, part_rad):
+            for j in range(-part_rad, part_rad):
+                if ti.pow(i, 2) + ti.pow(j, 2) < ti.pow(part_rad, 2):
+                    if \
+                        (particle_x + i < screen_x) \
+                        and (particle_y + j < screen_y) \
+                        and (particle_x + i >= 0) \
+                        and (particle_y + j >= 0) \
+                    :
+                        pixels[particle_x + i, particle_y + j] = part_color
 
 class FluidScene:
     part_radius: int
@@ -87,14 +107,14 @@ class FluidScene:
 
     def __init__(self, w: int, h: int, particle_count: int):
         self.part_radius = 10
-        self.part_color = [0, 0, 1]
+        self.part_color = tm.vec3([0.0, 0.0, 1.0])
         self.particles = []
         self.scene_width = w
         self.scene_height = h
         self.t = 0
         self.gui = ti.GUI("fluid", res=(w, h))
         self.gui.fps_limit = 60
-        self.pixels = np.zeros(shape=(self.scene_width, self.scene_height, 3), dtype=np.float16)
+        self.pixels = ti.Vector.field(3, dtype=ti.f32, shape=(self.scene_width, self.scene_height))
 
         for i in range(particle_count):
             self.particles.append(Particle(
@@ -103,8 +123,8 @@ class FluidScene:
                     random.random() * h
                 ],
                 [
-                    random.random() - 5.0,
-                    random.random() - 5.0
+                    random.random() - 1.0,
+                    random.random() - 1.0
                 ]
             ))
 
@@ -114,32 +134,28 @@ class FluidScene:
             particle_states.append(
                 [particle.p, particle.v]
             )
-        particle_states = np.array(particle_states, dtype=np.float16)
-        it = 0
+        particle_states = np.array(particle_states, dtype=np.float32)
         while self.gui.running:
-            it+=1
-            if it % 300 == 0:
-                print(particle_states.shape)
             self.t += DT
             increment_fluid(
                 particle_states,
                 self.scene_width,
                 self.scene_height
             )
-            self.pixels = np.ones(shape=(self.scene_width, self.scene_height, 3), dtype=np.float16)
             draw_ui(
                 self.pixels,
-                np.ascontiguousarray(particle_states[:, 0]),
-                tm.vec3(self.part_color),
+                particle_states,
+                self.part_color,
                 10
             )
             self.gui.set_image(self.pixels)
             self.gui.show()
+            self.pixels.fill(1.0)
 
 s = FluidScene(
     w=800,
     h=600,
-    particle_count=30
+    particle_count=200
 )
 
 s.run()
