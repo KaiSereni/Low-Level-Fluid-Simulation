@@ -10,8 +10,9 @@ TiParticleStateMatrix = ti.types.ndarray(dtype=ti.f32, ndim=3) # each particle h
 
 DT = np.float32(0.03)
 G = np.float32(400.0)
-PART_INFLUENCE_RANGE = np.float32(50.0)
-PART_FORCE = np.float32(1.0)
+BORDER_INFLUENCE_RANGE = np.float32(20.0)
+PART_INFLUENCE_RANGE = np.float32(45.0)
+PART_FORCE = np.float32(1.1)
 BOUNCE_DAMP = np.float32(0.95)
 FRICTION = np.float32(0.95)
 BROWNIAN_MOTION = np.float32(0.2)
@@ -26,27 +27,40 @@ class Particle:
         self.v = v
 
 @ti.func
-def distance_to_force(d: ti.f16) -> ti.f16:
+def distance_to_force(d: ti.f32) -> ti.f32:
     o = 0.0
     d = ti.abs(d)
-    if d < PART_INFLUENCE_RANGE:
-        o = (-4 * pow(d - PART_INFLUENCE_RANGE, 3))/pow(PART_INFLUENCE_RANGE, 3) * PART_INFLUENCE_RANGE
-    return o * PART_FORCE * DT
+    if d < 1:
+        o = -4 * pow(d - 1, 3)
+    return o
 
 @ti.kernel
 def increment_fluid(particle_states: TiParticleStateMatrix, sceneWidth: ti.i32, sceneHeight: ti.i32):
     num_parts = particle_states.shape[0]
     for i in range(num_parts):
+        part_x = particle_states[i, 0, 0]
+        part_y = particle_states[i, 0, 1]
+
+        if part_x < BORDER_INFLUENCE_RANGE:
+            particle_states[i, 1, 0] += distance_to_force(part_x/BORDER_INFLUENCE_RANGE)*BORDER_INFLUENCE_RANGE * DT
+        if part_y < BORDER_INFLUENCE_RANGE:
+            particle_states[i, 1, 1] += distance_to_force(part_y/BORDER_INFLUENCE_RANGE)*BORDER_INFLUENCE_RANGE * DT
+        if part_x > sceneWidth - BORDER_INFLUENCE_RANGE:
+            particle_states[i, 1, 0] -= distance_to_force((sceneWidth-part_x)/BORDER_INFLUENCE_RANGE)*BORDER_INFLUENCE_RANGE * DT
+        if part_y > sceneHeight - BORDER_INFLUENCE_RANGE:
+            particle_states[i, 1, 1] -= distance_to_force((sceneWidth-part_y)/BORDER_INFLUENCE_RANGE)*BORDER_INFLUENCE_RANGE * DT
+
         for other_particle_index in range(num_parts):
             if other_particle_index != i:
                 relative_pos = tm.vec2(
-                    particle_states[i, 0, 0] - particle_states[other_particle_index, 0, 0],
+                    part_x - particle_states[other_particle_index, 0, 0],
                     particle_states[i, 0, 1] - particle_states[other_particle_index, 0, 1]
                 )
                 r = relative_pos.norm()
-                force = distance_to_force(r)
-                particle_states[i, 1, 0] += relative_pos[0] * force
-                particle_states[i, 1, 1] += relative_pos[1] * force
+                force = distance_to_force(r/PART_INFLUENCE_RANGE)*PART_INFLUENCE_RANGE
+                particle_states[i, 1, 0] += relative_pos[0] * force * DT * PART_FORCE
+                particle_states[i, 1, 1] += relative_pos[1] * force * DT * PART_FORCE
+        
 
         particle_states[i, 0, 0] = particle_states[i, 0, 0] + ti.float32(particle_states[i, 1, 0] * DT)
         particle_states[i, 0, 1] = particle_states[i, 0, 1] + ti.float32(particle_states[i, 1, 1] * DT)
@@ -146,7 +160,7 @@ class FluidScene:
                 self.pixels,
                 particle_states,
                 self.part_color,
-                10
+                6
             )
             self.gui.set_image(self.pixels)
             self.gui.show()
@@ -155,7 +169,7 @@ class FluidScene:
 s = FluidScene(
     w=800,
     h=600,
-    particle_count=200
+    particle_count=400
 )
 
 s.run()
